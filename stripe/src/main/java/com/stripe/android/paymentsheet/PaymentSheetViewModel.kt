@@ -9,9 +9,14 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.stripe.android.ApiRequest
+import com.stripe.android.ApiResultCallback
 import com.stripe.android.PaymentConfiguration
+import com.stripe.android.PaymentIntentResult
+import com.stripe.android.Stripe
 import com.stripe.android.StripeApiRepository
+import com.stripe.android.StripePaymentController
 import com.stripe.android.StripeRepository
+import com.stripe.android.model.ConfirmPaymentIntentParams
 import com.stripe.android.model.ListPaymentMethodsParams
 import com.stripe.android.model.PaymentMethod
 import com.stripe.android.paymentsheet.model.PaymentSelection
@@ -28,14 +33,30 @@ internal class PaymentSheetViewModel internal constructor(
     private val stripeRepository: StripeRepository,
     private val workContext: CoroutineContext = Dispatchers.IO
 ) : AndroidViewModel(application) {
+
+    private val stripe = Stripe(
+        stripeRepository,
+        StripePaymentController(
+            application.applicationContext,
+            publishableKey,
+            stripeRepository,
+            true
+        ),
+        publishableKey,
+        stripeAccountId,
+        workContext
+    )
+
     private val mutableError = MutableLiveData<Throwable>()
     private val mutableTransition = MutableLiveData<TransitionTarget>()
     private val mutablePaymentMethods = MutableLiveData<List<PaymentMethod>>()
     private val mutableSelection = MutableLiveData<PaymentSelection?>()
+    private val mutablePaymentIntentResult = MutableLiveData<PaymentIntentResult>()
     internal val paymentMethods: LiveData<List<PaymentMethod>> = mutablePaymentMethods
     internal val error: LiveData<Throwable> = mutableError
     internal val transition: LiveData<TransitionTarget> = mutableTransition
     internal val selection: LiveData<PaymentSelection?> = mutableSelection
+    internal val paymentIntentResult: LiveData<PaymentIntentResult> = mutablePaymentIntentResult
 
     fun onError(throwable: Throwable) {
         mutableError.postValue(throwable)
@@ -50,10 +71,7 @@ internal class PaymentSheetViewModel internal constructor(
     }
 
     fun updatePaymentMethods(intent: Intent) {
-        val args: PaymentSheetActivityStarter.Args? = PaymentSheetActivityStarter.Args.fromIntent(intent)
-        if (args == null) {
-            onError(IllegalStateException("Missing activity args"))
-        } else {
+        getPaymentSheetActivityArgs(intent)?.let { args ->
             updatePaymentMethods(
                 args.ephemeralKey,
                 args.customerId
@@ -61,9 +79,60 @@ internal class PaymentSheetViewModel internal constructor(
         }
     }
 
+    fun checkout(activity: PaymentSheetActivity) {
+        val args = getPaymentSheetActivityArgs(activity.intent) ?: return
+        // TODO(smaskell): Show processing indicator
+        when (val selection = selection.value) {
+            PaymentSelection.GooglePay -> TODO("smaskell: handle Google Pay confirmation")
+            is PaymentSelection.Saved -> {
+                // TODO(smaskell): Properly set savePaymentMethod/setupFutureUsage
+                stripe.confirmPayment(
+                    activity,
+                    ConfirmPaymentIntentParams.createWithPaymentMethodId(
+                        selection.paymentMethodId,
+                        args.clientSecret
+                    )
+                )
+            }
+            is PaymentSelection.New -> {
+                stripe.confirmPayment(
+                    activity,
+                    ConfirmPaymentIntentParams.createWithPaymentMethodCreateParams(
+                        selection.paymentMethodCreateParams,
+                        args.clientSecret
+                    )
+                )
+            }
+            null -> TODO("smaskell: Log error state - this should never happen")
+        }
+    }
+
+    fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        stripe.onPaymentResult(
+            requestCode, data,
+            object : ApiResultCallback<PaymentIntentResult> {
+                override fun onSuccess(result: PaymentIntentResult) {
+                    mutablePaymentIntentResult.postValue(result)
+                }
+
+                override fun onError(e: Exception) {
+                    onError(e)
+                }
+            }
+        )
+    }
+
     @VisibleForTesting
     internal fun setPaymentMethods(paymentMethods: List<PaymentMethod>) {
         mutablePaymentMethods.postValue(paymentMethods)
+    }
+
+    private fun getPaymentSheetActivityArgs(intent: Intent): PaymentSheetActivityStarter.Args? {
+        val args: PaymentSheetActivityStarter.Args? = PaymentSheetActivityStarter.Args.fromIntent(intent)
+        if (args == null) {
+            onError(IllegalStateException("Missing activity args"))
+        }
+        return args
     }
 
     private fun updatePaymentMethods(
